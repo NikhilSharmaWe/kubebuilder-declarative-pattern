@@ -1,20 +1,23 @@
 package applier
 
 import (
-	"context"
-	"fmt"
-	"os"
-	"strings"
+        "context"
+        "fmt"
+        "os"
+        "strings"
 
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/printers"
-	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/rest"
-	"k8s.io/kubectl/pkg/cmd/apply"
-	cmdDelete "k8s.io/kubectl/pkg/cmd/delete"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+        "k8s.io/apimachinery/pkg/api/meta"
+        metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+        "k8s.io/apimachinery/pkg/util/sets"
+        "k8s.io/cli-runtime/pkg/genericclioptions"
+        "k8s.io/cli-runtime/pkg/printers"
+        "k8s.io/cli-runtime/pkg/resource"
+        "k8s.io/client-go/discovery"
+        "k8s.io/client-go/rest"
+        "k8s.io/kubectl/pkg/cmd/apply"
+        cmdDelete "k8s.io/kubectl/pkg/cmd/delete"
+        cmdutil "k8s.io/kubectl/pkg/cmd/util"
+        "k8s.io/kubectl/pkg/scheme"
 )
 
 type DirectApplier struct {
@@ -23,101 +26,112 @@ type DirectApplier struct {
 var _ Applier = &DirectApplier{}
 
 func NewDirectApplier() *DirectApplier {
-	return &DirectApplier{}
+        return &DirectApplier{}
 }
 
 func (d *DirectApplier) Apply(ctx context.Context, opt ApplierOptions) error {
-	ioStreams := genericclioptions.IOStreams{
-		In:     os.Stdin,
-		Out:    os.Stdout,
-		ErrOut: os.Stderr,
-	}
-	ioReader := strings.NewReader(opt.Manifest)
+        ioStreams := genericclioptions.IOStreams{
+                In:     os.Stdin,
+                Out:    os.Stdout,
+                ErrOut: os.Stderr,
+        }
+        ioReader := strings.NewReader(opt.Manifest)
 
-	restClientGetter := &staticRESTClientGetter{
-		RESTMapper: opt.RESTMapper,
-		RESTConfig: opt.RESTConfig,
-	}
-	b := resource.NewBuilder(restClientGetter)
+        restClientGetter := &staticRESTClientGetter{
+                RESTMapper: opt.RESTMapper,
+                RESTConfig: opt.RESTConfig,
+        }
+        b := resource.NewBuilder(restClientGetter)
+        f := cmdutil.NewFactory(&genericclioptions.ConfigFlags{})
+        if opt.Validate {
+                // This potentially causes redundant work, but validation isn't the common path
+                dynamicClient, err := f.DynamicClient()
+                if err != nil {
+                        return err
+                }
+                nqpv := resource.NewQueryParamVerifier(dynamicClient, f.OpenAPIGetter(), resource.QueryParamFieldValidation)
+                v, err := cmdutil.NewFactory(&genericclioptions.ConfigFlags{}).Validator(metav1.FieldValidationStrict, nqpv)
+                if err != nil {
+                        return err
+                }
+                b.Schema(v)
+        }
 
-	if opt.Validate {
-		// This potentially causes redundant work, but validation isn't the common path
-		v, err := cmdutil.NewFactory(&genericclioptions.ConfigFlags{}).Validator(true)
-		if err != nil {
-			return err
-		}
-		b.Schema(v)
-	}
+        res := b.Unstructured().Stream(ioReader, "manifestString").Do()
+        infos, err := res.Infos()
+        if err != nil {
+                return err
+        }
 
-	res := b.Unstructured().Stream(ioReader, "manifestString").Do()
-	infos, err := res.Infos()
-	if err != nil {
-		return err
-	}
+        // Populate the namespace on any namespace-scoped objects
+        if opt.Namespace != "" {
+                visitor := resource.SetNamespace(opt.Namespace)
+                for _, info := range infos {
+                        if err := info.Visit(visitor); err != nil {
+                                return fmt.Errorf("error from SetNamespace: %w", err)
+                        }
+                }
+        }
 
-	// Populate the namespace on any namespace-scoped objects
-	if opt.Namespace != "" {
-		visitor := resource.SetNamespace(opt.Namespace)
-		for _, info := range infos {
-			if err := info.Visit(visitor); err != nil {
-				return fmt.Errorf("error from SetNamespace: %w", err)
-			}
-		}
-	}
+        baseName := "declarative-direct"
+        applyFlags := apply.NewApplyFlags(f, ioStreams)
+        applyCmd := apply.NewCmdApply(baseName, f, ioStreams)
+        applyOpts, err := applyFlags.ToOptions(applyCmd, baseName, nil)
+        if err != nil {
+                return fmt.Errorf("error getting apply options: %w", err)
+        }
 
-	applyOpts := apply.NewApplyOptions(ioStreams)
+        for i, arg := range opt.ExtraArgs {
+                switch arg {
+                case "--force":
+                        applyOpts.ForceConflicts = true
+                case "--prune":
+                        applyOpts.Prune = true
+                case "--selector":
+                        applyOpts.Selector = opt.ExtraArgs[i+1]
+                default:
+                        continue
+                }
+        }
 
-	for i, arg := range opt.ExtraArgs {
-		switch arg {
-		case "--force":
-			applyOpts.ForceConflicts = true
-		case "--prune":
-			applyOpts.Prune = true
-		case "--selector":
-			applyOpts.Selector = opt.ExtraArgs[i+1]
-		default:
-			continue
-		}
-	}
+        applyOpts.Namespace = opt.Namespace
+        applyOpts.SetObjects(infos)
+        applyOpts.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
+                applyOpts.PrintFlags.NamePrintFlags.Operation = operation
+                cmdutil.PrintFlagsWithDryRunStrategy(applyOpts.PrintFlags, applyOpts.DryRunStrategy)
+                return applyOpts.PrintFlags.ToPrinter()
+        }
+        applyOpts.DeleteOptions = &cmdDelete.DeleteOptions{
+                IOStreams: ioStreams,
+        }
 
-	applyOpts.Namespace = opt.Namespace
-	applyOpts.SetObjects(infos)
-	applyOpts.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
-		applyOpts.PrintFlags.NamePrintFlags.Operation = operation
-		cmdutil.PrintFlagsWithDryRunStrategy(applyOpts.PrintFlags, applyOpts.DryRunStrategy)
-		return applyOpts.PrintFlags.ToPrinter()
-	}
-	applyOpts.DeleteOptions = &cmdDelete.DeleteOptions{
-		IOStreams: ioStreams,
-	}
-
-	return applyOpts.Run()
+        return applyOpts.Run()
 }
 
 // staticRESTClientGetter returns a fixed RESTClient
 type staticRESTClientGetter struct {
-	RESTConfig      *rest.Config
-	DiscoveryClient discovery.CachedDiscoveryInterface
-	RESTMapper      meta.RESTMapper
+        RESTConfig      *rest.Config
+        DiscoveryClient discovery.CachedDiscoveryInterface
+        RESTMapper      meta.RESTMapper
 }
 
 var _ resource.RESTClientGetter = &staticRESTClientGetter{}
 
 func (s *staticRESTClientGetter) ToRESTConfig() (*rest.Config, error) {
-	if s.RESTConfig == nil {
-		return nil, fmt.Errorf("RESTConfig not set")
-	}
-	return s.RESTConfig, nil
+        if s.RESTConfig == nil {
+                return nil, fmt.Errorf("RESTConfig not set")
+        }
+        return s.RESTConfig, nil
 }
 func (s *staticRESTClientGetter) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, error) {
-	if s.DiscoveryClient == nil {
-		return nil, fmt.Errorf("DiscoveryClient not set")
-	}
-	return s.DiscoveryClient, nil
+        if s.DiscoveryClient == nil {
+                return nil, fmt.Errorf("DiscoveryClient not set")
+        }
+        return s.DiscoveryClient, nil
 }
 func (s *staticRESTClientGetter) ToRESTMapper() (meta.RESTMapper, error) {
-	if s.RESTMapper == nil {
-		return nil, fmt.Errorf("RESTMapper not set")
-	}
-	return s.RESTMapper, nil
+        if s.RESTMapper == nil {
+                return nil, fmt.Errorf("RESTMapper not set")
+        }
+        return s.RESTMapper, nil
 }
